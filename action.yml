@@ -1,0 +1,90 @@
+name: 'LeakTrace PR Scan'
+description: 'Scan PR diff for sensitive data leak paths using taint analysis'
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  severity-threshold:
+    description: 'Minimum severity to report (medium, high, critical)'
+    required: false
+    default: 'high'
+  format:
+    description: 'Output format (text, json, sarif)'
+    required: false
+    default: 'sarif'
+  fail-on-leak:
+    description: 'Fail the check run if leaks are found'
+    required: false
+    default: 'true'
+  version:
+    description: 'LeakTrace version to download (e.g. v0.1.0 or latest)'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download LeakTrace binary
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [ "${INPUT_VERSION}" = "latest" ]; then
+          DOWNLOAD_URL=$(gh api repos/openkickstart/leaktrace/releases/latest \
+            --jq '.assets[] | select(.name | test("linux.*amd64")) | .browser_download_url')
+        else
+          DOWNLOAD_URL=$(gh api "repos/openkickstart/leaktrace/releases/tags/${INPUT_VERSION}" \
+            --jq '.assets[] | select(.name | test("linux.*amd64")) | .browser_download_url')
+        fi
+        curl -sSL "${DOWNLOAD_URL}" -o "${RUNNER_TEMP}/leaktrace"
+        chmod +x "${RUNNER_TEMP}/leaktrace"
+        echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+
+    - name: Get PR diff file list
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        gh pr diff "${PR_NUMBER}" --name-only > "${RUNNER_TEMP}/leaktrace-diff-files.txt"
+        echo "::group::Files changed in PR"
+        cat "${RUNNER_TEMP}/leaktrace-diff-files.txt"
+        echo "::endgroup::"
+
+    - name: Run LeakTrace scan (generate report)
+      shell: bash
+      env:
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_THRESHOLD: ${{ inputs.severity-threshold }}
+      run: |
+        set -eo pipefail
+        cat "${RUNNER_TEMP}/leaktrace-diff-files.txt" | leaktrace \
+          --diff-only \
+          --format "${INPUT_FORMAT}" \
+          --severity-threshold "${INPUT_THRESHOLD}" \
+          --exit-code 0 \
+          > "${RUNNER_TEMP}/leaktrace-results.sarif" || true
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: inputs.format == 'sarif'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ runner.temp }}/leaktrace-results.sarif
+        category: leaktrace
+
+    - name: Enforce leak policy
+      if: inputs.fail-on-leak == 'true'
+      shell: bash
+      env:
+        INPUT_THRESHOLD: ${{ inputs.severity-threshold }}
+      run: |
+        set -eo pipefail
+        cat "${RUNNER_TEMP}/leaktrace-diff-files.txt" | leaktrace \
+          --diff-only \
+          --format text \
+          --severity-threshold "${INPUT_THRESHOLD}" \
+          --exit-code 1
